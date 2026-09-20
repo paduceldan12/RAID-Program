@@ -1,0 +1,345 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int get_1e_block_offset(int disk, int target_B, int N) {
+    int count = 0;
+    for(int i = 0; i < target_B; i++) {
+        if (i % N == disk || (i + 1) % N == disk) {
+            count++;
+        }
+    }
+    return count;
+}
+int main(int argc, char *argv[]) {
+    if (argc != 9) {
+        printf("Xrisi: ./ergasia1 RAIDX SIZE BLOCKSIZE N inputFile.txt updates.txt backup.txt allData.txt\n");
+        return 1;
+    }
+    // Αποθήκευση σε μεταβλητές
+    char *raid_level = argv[1];
+    int size = atoi(argv[2]);
+    int blocksize = atoi(argv[3]);
+    int n = atoi(argv[4]);
+    char *inputFile = argv[5];
+    char *updatesFile = argv[6];
+    char *backupFile = argv[7];
+    char *allDataFile = argv[8];   
+    //Υπολογισμός μέγιστης χωρητικότητας του RAID συστήματος
+    int max_capacity = 0;
+    if (strcmp(raid_level, "RAID1") == 0) {
+        max_capacity = size;
+    } else if (strcmp(raid_level, "RAID1E") == 0) {
+        max_capacity = (size * n) / 2;
+    } else { 
+        max_capacity = size * (n - 1);
+    }
+
+    //ποσα BYTES ειναι το αρχειο εισοδου
+    FILE *fin = fopen(inputFile, "r");
+    if (fin == NULL) {
+        printf("Sfalma: To arxeio %s den vre8ike!\n", inputFile);
+        return 1;
+    }
+   
+    fseek(fin, 0, SEEK_END);     
+    long file_size = ftell(fin);  
+    fseek(fin, 0, SEEK_SET);      
+    // Ελέγχος  αν το  αρχείο ξεπερνάει τη χωρητικότητα
+    if (file_size > max_capacity) {
+        printf("Sfalma: To arxeio (%ld bits) den xoraei sto sistima (Max: %d bits)!\n", file_size, max_capacity);
+        fclose(fin);
+        return 1;
+    }
+
+    for (int i = 0; i < n; i++) {
+        char filename[50];
+        // Δημιουργια του αρχειου
+        sprintf(filename, "%s_%d.txt", raid_level, i);
+       
+        FILE *f = fopen(filename, "w");
+        for (int j = 0; j < size; j++) {
+            fputc('0', f); // γεμιζει 0
+        }
+        fclose(f);
+    }
+
+    char *inputData = (char *)malloc(file_size + 1); // +1 για το '\0' του string
+    fscanf(fin, "%s", inputData);
+    fclose(fin);
+   
+    //Μετρημα  του string αν υπήρχουν κενά,αλλαγές γραμμής
+    int inputLen = strlen(inputData);
+
+    // Αποθήκευση στο backup.txt
+    FILE *fbackup = fopen(backupFile, "w");
+    fprintf(fbackup, "%s", inputData);
+    fclose(fbackup);
+
+    FILE *disks[20]; // Πίνακας για τους δείκτες των αρχείων δίσκων
+    for (int i = 0; i < n; i++) {
+        char filename[50];
+        sprintf(filename, "%s_%d.txt", raid_level, i);
+        disks[i] = fopen(filename, "r+"); // Άνοιγμα για διάβασμα/γράψιμο
+    }
+
+    for (int p = 0; p < inputLen; p++) {
+        int B = p / blocksize;        
+        int b_offset = p % blocksize;
+       
+        int d1 = -1, o1 = -1, d2 = -1, o2 = -1; // Δίσκοι και  θέσεις δεδομένων
+        int pd = -1, po = -1;                   // Δίσκος και θέση Parity
+
+        // Βρισκω καλο δθσκο ανάλογα με RAID
+        if (strcmp(raid_level, "RAID1") == 0) {
+            d1 = 0; o1 = p;
+            d2 = 1; o2 = p;
+        }
+        else if (strcmp(raid_level, "RAID1E") == 0) {
+            d1 = B % n;
+            d2 = (B + 1) % n;
+            o1 = get_1e_block_offset(d1, B, n) * blocksize + b_offset;
+            o2 = get_1e_block_offset(d2, B, n) * blocksize + b_offset;
+        }
+        else if (strcmp(raid_level, "RAID4") == 0) {
+            int R = B / (n - 1);
+            d1 = B % (n - 1);
+            o1 = R * blocksize + b_offset;
+            pd = n - 1;         
+            po = o1;
+        }
+        else if (strcmp(raid_level, "RAID5") == 0) {
+            int R = B / (n - 1);
+            pd = (n - 1 - (R % n) + n) % n; 
+            po = R * blocksize + b_offset;
+           
+            int b_in_row = B % (n - 1);
+            if (b_in_row < pd) {
+                d1 = b_in_row;
+            } else {
+                d1 = b_in_row + 1;
+            }
+            o1 = po;
+        }
+
+        // Γράψιμο δεδομενων στους δίσκους
+        if (d1 != -1 && o1 < size) {
+            fseek(disks[d1], o1, SEEK_SET);
+            fputc(inputData[p], disks[d1]);
+        }
+        if (d2 != -1 && o2 < size) {
+            fseek(disks[d2], o2, SEEK_SET);
+            fputc(inputData[p], disks[d2]);
+        }
+       
+        // Ενημερώση  Parity (RAID 4 & 5)
+        if (pd != -1 && po < size) {
+            fseek(disks[pd], po, SEEK_SET);
+            char old_parity = fgetc(disks[pd]);
+           
+            //XOR
+            char new_parity;
+            if (old_parity == inputData[p]) {
+                new_parity = '0';
+            } else {
+                new_parity = '1';
+            }
+           
+            fseek(disks[pd], po, SEEK_SET);
+            fputc(new_parity, disks[pd]);
+        }
+    }
+
+    FILE *fupd = fopen(updatesFile, "r");
+    if (fupd != NULL) {
+        int pos;
+        char val;
+        while (fscanf(fupd, "%d %c", &pos, &val) == 2) {
+            if (pos >= inputLen || inputData[pos] == val) {
+                continue;
+            }
+           
+            char old_val = inputData[pos];
+            inputData[pos] = val;
+
+            int B = pos / blocksize;
+            int b_offset = pos % blocksize;
+            int d1=-1, o1=-1, d2=-1, o2=-1, pd=-1, po=-1;
+
+            if (strcmp(raid_level, "RAID1") == 0) {
+                d1=0; o1=pos; d2=1; o2=pos;
+            }
+            else if (strcmp(raid_level, "RAID1E") == 0) {
+                d1 = B % n; d2 = (B + 1) % n;
+                o1 = get_1e_block_offset(d1, B, n) * blocksize + b_offset;
+                o2 = get_1e_block_offset(d2, B, n) * blocksize + b_offset;
+            }
+            else if (strcmp(raid_level, "RAID4") == 0) {
+                int R = B / (n - 1); d1 = B % (n - 1); o1 = R * blocksize + b_offset;
+                pd = n - 1; po = o1;
+            }
+            else if (strcmp(raid_level, "RAID5") == 0) {
+                int R = B / (n - 1); pd = (n - 1 - (R % n) + n) % n; po = R * blocksize + b_offset;
+                int b_in_row = B % (n - 1);
+                if (b_in_row < pd) d1 = b_in_row; else d1 = b_in_row + 1;
+                o1 = po;
+            }
+
+            //νέο bit
+            if (d1 != -1) { fseek(disks[d1], o1, SEEK_SET); fputc(val, disks[d1]); }
+            if (d2 != -1) { fseek(disks[d2], o2, SEEK_SET); fputc(val, disks[d2]); }
+
+            // Υπολογισμός Parity
+            if (pd != -1) {
+                fseek(disks[pd], po, SEEK_SET);
+                char old_parity = fgetc(disks[pd]);
+                
+                char temp_parity;
+                if (old_parity == old_val) temp_parity = '0'; else temp_parity = '1';
+               
+                char final_parity;
+                if (temp_parity == val) final_parity = '0'; else final_parity = '1';
+               
+                fseek(disks[pd], po, SEEK_SET);
+                fputc(final_parity, disks[pd]);
+            }
+        }
+        fclose(fupd);
+       
+        // Ανανέωση του backup
+        fbackup = fopen(backupFile, "w");
+        fprintf(fbackup, "%s", inputData);
+        fclose(fbackup);
+    }
+
+    // Κλείνουμε τους δίσκους για να τους σβήσουμε μετά
+    for (int i = 0; i < n; i++) {
+        fclose(disks[i]);
+    }
+
+    int failed_disk;
+    printf("\nPoios diskos parousiazei sfalma: ");
+    scanf("%d", &failed_disk);
+
+    char failed_filename[50];
+    sprintf(failed_filename, "%s_%d.txt", raid_level, failed_disk);
+    remove(failed_filename); 
+
+    FILE *survivors[20];
+    for(int i = 0; i < n; i++) {
+        if (i != failed_disk) {
+            char fname[50];
+            sprintf(fname, "%s_%d.txt", raid_level, i);
+            survivors[i] = fopen(fname, "r");
+        }
+    }
+   
+    FILE *recovered = fopen(failed_filename, "w");
+
+    for (int col = 0; col < size; col++) {
+        char rec_bit = '0'; //ανακτηση αποτυχημενου δισκου
+
+        if (strcmp(raid_level, "RAID4") == 0 || strcmp(raid_level, "RAID5") == 0) {
+            rec_bit = '0';
+            for(int i = 0; i < n; i++) {
+                if (i != failed_disk) {
+                    fseek(survivors[i], col, SEEK_SET);
+                    char curr_bit = fgetc(survivors[i]);
+                    // Ενημέρωση του ανακτημένου bit με XOR
+                    if (rec_bit == curr_bit) {
+                        rec_bit = '0';
+                    } else {
+                        rec_bit = '1';
+                    }
+                }
+            }
+        }
+        else if (strcmp(raid_level, "RAID1") == 0) {
+            int sur_d = (failed_disk == 0) ? 1 : 0;
+            fseek(survivors[sur_d], col, SEEK_SET);
+            rec_bit = fgetc(survivors[sur_d]);
+        }
+        else if (strcmp(raid_level, "RAID1E") == 0) {
+            int block_on_disk = col / blocksize;
+            int curr_b = 0, target_B = -1;
+            int max_B = (size * n) / blocksize;
+           
+            for(int B = 0; B < max_B; B++) {
+                if (B % n == failed_disk || (B + 1) % n == failed_disk) {
+                    if (curr_b == block_on_disk) { target_B = B; break; }
+                    curr_b++;
+                }
+            }
+            if (target_B != -1) {
+                int mirror = (target_B % n == failed_disk) ? (target_B + 1) % n : target_B % n;
+                int mirror_offset = get_1e_block_offset(mirror, target_B, n) * blocksize + (col % blocksize);
+                fseek(survivors[mirror], mirror_offset, SEEK_SET);
+                rec_bit = fgetc(survivors[mirror]);
+            }
+        }
+        fputc(rec_bit, recovered);
+    }
+
+    fclose(recovered);
+    for(int i = 0; i < n; i++) {
+        if (i != failed_disk) fclose(survivors[i]);
+    }
+
+    FILE *fallData = fopen(allDataFile, "w");
+    for (int i = 0; i < n; i++) {
+        char fname[50];
+        sprintf(fname, "%s_%d.txt", raid_level, i);
+        disks[i] = fopen(fname, "r");
+    }
+
+    for (int p = 0; p < inputLen; p++) {
+        int B = p / blocksize;
+        int b_offset = p % blocksize;
+        int d1 = 0, o1 = 0;
+
+        if (strcmp(raid_level, "RAID1") == 0) { d1 = 0; o1 = p; }
+        else if (strcmp(raid_level, "RAID1E") == 0) {
+            d1 = B % n;
+            o1 = get_1e_block_offset(d1, B, n) * blocksize + b_offset;
+        }
+        else if (strcmp(raid_level, "RAID4") == 0) {
+            d1 = B % (n - 1);
+            o1 = (B / (n - 1)) * blocksize + b_offset;
+        }
+        else if (strcmp(raid_level, "RAID5") == 0) {
+            int R = B / (n - 1);
+            int pd = (n - 1 - (R % n) + n) % n;
+            int b_in_row = B % (n - 1);
+            if (b_in_row < pd) d1 = b_in_row; else d1 = b_in_row + 1;
+            o1 = R * blocksize + b_offset;
+        }
+
+        fseek(disks[d1], o1, SEEK_SET);
+        fputc(fgetc(disks[d1]), fallData);
+    }
+   
+    fclose(fallData);
+    for (int i = 0; i < n; i++) fclose(disks[i]);
+
+    FILE *f1 = fopen(backupFile, "r");
+    FILE *f2 = fopen(allDataFile, "r");
+   
+    char *b_data = (char *)malloc(inputLen + 1);
+    char *a_data = (char *)malloc(inputLen + 1);
+   
+    fscanf(f1, "%s", b_data);
+    fscanf(f2, "%s", a_data);
+    fclose(f1);
+    fclose(f2);
+
+    if (strcmp(b_data, a_data) == 0) {
+        printf("\n100%% similarity\n");
+    } else {
+        printf("\nTa dedomena den tautizontai!\n");
+    }
+
+    free(inputData);
+    free(b_data);
+    free(a_data);
+    return 0;
+}
